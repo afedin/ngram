@@ -14,7 +14,7 @@ python preprocess.py
 import random
 
 # read in all the names (32,032 names in total)
-names = open("/Users/iuser/projects/geocoder/ngram/data/names.txt", 'r').readlines()
+names = open("names.txt", 'r').readlines()
 
 # get a permutation
 random.seed(42) # fix seed for reproducibility
