@@ -1,133 +1,133 @@
 """
-n-gram Language Model
+n-gram Language Model for Geographic Data
 
-Good reference:
-Speech and Language Processing. Daniel Jurafsky & James H. Martin.
-https://web.stanford.edu/~jurafsky/slp3/3.pdf
-
-Example run:
-python ngram.py
+This version is adapted to work with geographic data including coordinates,
+addresses, and location information. Uses sparse matrices for efficiency.
 """
 
 import os
 import itertools
 import numpy as np
+from collections import defaultdict
+import re
+
+# -----------------------------------------------------------------------------
+# data processing and tokenization
+
+def normalize_coordinate(coord_str):
+    """Round coordinates to reduce vocabulary size."""
+    try:
+        return f"{float(coord_str):.3f}"  # Reduce precision to 3 decimal places
+    except ValueError:
+        return coord_str
+
+def tokenize(text):
+    """
+    Tokenize text into individual tokens.
+    Handles numbers, letters, spaces, and special characters.
+    """
+    tokens = []
+    for line in text.split('\n'):
+        if not line.strip():
+            continue
+        # Split on pipe and process each part
+        parts = line.split('|')
+        for i, part in enumerate(parts):
+            part = part.strip()
+            if i == 0:  # First part is coordinates
+                # Split and normalize coordinates
+                try:
+                    lat, lon = part.split(',')
+                    tokens.extend([normalize_coordinate(lat), normalize_coordinate(lon)])
+                except ValueError:
+                    # If coordinates can't be split, add as is
+                    tokens.append(part)
+            else:
+                # For other parts, split on space
+                tokens.extend(part.split())
+        tokens.append('\n')  # Add newline token between entries
+    return tokens
+
+def detokenize(tokens):
+    """Convert tokens back into text."""
+    return ' '.join(tokens)
 
 # -----------------------------------------------------------------------------
 # random number generation
 
-# class that mimics the random interface in Python, fully deterministic,
-# and in a way that we also control fully, and can also use in C, etc.
 class RNG:
     def __init__(self, seed):
         self.state = seed
 
     def random_u32(self):
-        # xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-        # doing & 0xFFFFFFFFFFFFFFFF is the same as cast to uint64 in C
-        # doing & 0xFFFFFFFF is the same as cast to uint32 in C
         self.state ^= (self.state >> 12) & 0xFFFFFFFFFFFFFFFF
         self.state ^= (self.state << 25) & 0xFFFFFFFFFFFFFFFF
         self.state ^= (self.state >> 27) & 0xFFFFFFFFFFFFFFFF
         return ((self.state * 0x2545F4914F6CDD1D) >> 32) & 0xFFFFFFFF
 
     def random(self):
-        # random float32 in [0, 1)
         return (self.random_u32() >> 8) / 16777216.0
 
 # -----------------------------------------------------------------------------
 # sampling from the model
 
 def sample_discrete(probs, coinf):
-    # sample from a discrete distribution
     cdf = 0.0
     for i, prob in enumerate(probs):
         cdf += prob
         if coinf < cdf:
             return i
-    return len(probs) - 1  # in case of rounding errors
+    return len(probs) - 1
 
 # -----------------------------------------------------------------------------
-# models: n-gram model, and a fallback model that can use multiple n-gram models
+# n-gram model with sparse storage
 
 class NgramModel:
-    def __init__(self, vocab_size, seq_len, smoothing=0.0):
+    def __init__(self, vocab_size, seq_len, smoothing=0.1):
         self.seq_len = seq_len
         self.vocab_size = vocab_size
         self.smoothing = smoothing
-        # the parameters of this model: an n-dimensional array of counts
-        self.counts = np.zeros((vocab_size,) * seq_len, dtype=np.uint32)
-        # a buffer to store the uniform distribution, just to avoid creating it every time
+        # Use dictionary for sparse storage
+        self.counts = defaultdict(int)
+        self.context_totals = defaultdict(int)
         self.uniform = np.ones(self.vocab_size, dtype=np.float32) / self.vocab_size
 
     def train(self, tape):
         assert isinstance(tape, list)
         assert len(tape) == self.seq_len
-        self.counts[tuple(tape)] += 1
+        context = tuple(tape[:-1])
+        target = tape[-1]
+        self.counts[(context, target)] += 1
+        self.context_totals[context] += 1
 
-    def get_counts(self, tape):
-        assert isinstance(tape, list)
-        assert len(tape) == self.seq_len - 1
-        return self.counts[tuple(tape)]
+    def get_counts(self, context):
+        context = tuple(context)
+        counts = np.zeros(self.vocab_size, dtype=np.float32)
+        for i in range(self.vocab_size):
+            counts[i] = self.counts.get((context, i), 0)
+        return counts
 
-    def __call__(self, tape):
-        # returns the conditional probability distribution of the next token
-        assert isinstance(tape, list)
-        assert len(tape) == self.seq_len - 1
-        # get the counts, apply smoothing, and normalize to get the probabilities
-        counts = self.counts[tuple(tape)].astype(np.float32)
-        counts += self.smoothing # add smoothing ("fake counts") to all counts
+    def __call__(self, context):
+        context = tuple(context)
+        counts = self.get_counts(context)
+        counts += self.smoothing
         counts_sum = counts.sum()
         probs = counts / counts_sum if counts_sum > 0 else self.uniform
         return probs
 
-# currently unused, just for illustration
-class BackoffNgramModel:
-    """
-    A backoff model that can be used to combine multiple n-gram models of different orders.
-    During training, it updates all the models with the same data.
-    During inference, it uses the highest order model that has data for the current context.
-    """
-    def __init__(self, vocab_size, seq_len, smoothing=0.0, counts_threshold=0):
-        self.seq_len = seq_len
-        self.vocab_size = vocab_size
-        self.smoothing = smoothing
-        self.counts_threshold = counts_threshold
-        self.models = {i: NgramModel(vocab_size, i, smoothing) for i in range(1, seq_len + 1)}
-
-    def train(self, tape):
-        assert isinstance(tape, list)
-        assert len(tape) == self.seq_len
-        for i in range(1, self.seq_len + 1):
-            self.models[i].train(tape[-i:])
-
-    def __call__(self, tape):
-        assert isinstance(tape, list)
-        assert len(tape) == self.seq_len - 1
-        # find the highest order model that has data for the current context
-        for i in reversed(range(1, self.seq_len + 1)):
-            tape_i = tape[-i+1:] if i > 1 else []
-            counts = self.models[i].get_counts(tape_i)
-            if counts.sum() > self.counts_threshold:
-                return self.models[i](tape_i)
-        # we shouldn't get here because unigram model should always have data
-        raise ValueError("no model found for the current context")
-
 # -----------------------------------------------------------------------------
-# data iteration and evaluation utils
+# data iteration and evaluation
 
-# small utility function to iterate tokens with a fixed-sized window
 def dataloader(tokens, window_size):
     for i in range(len(tokens) - window_size + 1):
         yield tokens[i:i+window_size]
 
 def eval_split(model, tokens):
-    # evaluate a given model on a given sequence of tokens (splits, usually)
     sum_loss = 0.0
     count = 0
     for tape in dataloader(tokens, model.seq_len):
-        x = tape[:-1] # the context
-        y = tape[-1]  # the target
+        x = tape[:-1]
+        y = tape[-1]
         probs = model(x)
         prob = probs[y]
         sum_loss += -np.log(prob)
@@ -136,73 +136,86 @@ def eval_split(model, tokens):
     return mean_loss
 
 # -----------------------------------------------------------------------------
+# main training and generation
 
-# "train" the Tokenizer, so we're able to map between characters and tokens
-train_text = open('data/train.txt', 'r').read()
-assert all(c == '\n' or ('a' <= c <= 'z') for c in train_text)
-uchars = sorted(list(set(train_text))) # unique characters we see in the input
-vocab_size = len(uchars)
-char_to_token = {c: i for i, c in enumerate(uchars)}
-token_to_char = {i: c for i, c in enumerate(uchars)}
-EOT_TOKEN = char_to_token['\n'] # designate \n as the delimiting <|endoftext|> token
-# pre-tokenize all the splits one time up here
-test_tokens = [char_to_token[c] for c in open('data/test.txt', 'r').read()]
-val_tokens = [char_to_token[c] for c in open('data/val.txt', 'r').read()]
-train_tokens = [char_to_token[c] for c in open('data/train.txt', 'r').read()]
-
-# hyperparameter search with grid search over the validation set
-seq_lens = [3, 4, 5]
-smoothings = [0.03, 0.1, 0.3, 1.0]
-best_loss = float('inf')
-best_kwargs = {}
-for seq_len, smoothing in itertools.product(seq_lens, smoothings):
-    # train the n-gram model
-    model = NgramModel(vocab_size, seq_len, smoothing)
-    for tape in dataloader(train_tokens, seq_len):
+def main():
+    # Read all data files first
+    train_text = open('data/train.txt', 'r').read()
+    val_text = open('data/val.txt', 'r').read()
+    test_text = open('data/test.txt', 'r').read()
+    
+    # Tokenize all data to build vocabulary
+    all_tokens = []
+    for text in [train_text, val_text, test_text]:
+        all_tokens.extend(tokenize(text))
+    
+    # Create vocabulary from all tokens
+    unique_tokens = sorted(list(set(all_tokens)))
+    vocab_size = len(unique_tokens)
+    token_to_idx = {token: i for i, token in enumerate(unique_tokens)}
+    idx_to_token = {i: token for i, token in enumerate(unique_tokens)}
+    
+    # Convert text to indices
+    train_tokens = [token_to_idx[t] for t in tokenize(train_text)]
+    val_tokens = [token_to_idx[t] for t in tokenize(val_text)]
+    test_tokens = [token_to_idx[t] for t in tokenize(test_text)]
+    
+    print(f"Vocabulary size: {vocab_size}")
+    print("Sample tokens:", unique_tokens[:10])
+    
+    # Hyperparameter search
+    seq_lens = [3, 4]  # Reduced sequence lengths
+    smoothings = [0.01, 0.1, 0.3, 1.0]
+    best_loss = float('inf')
+    best_kwargs = {}
+    
+    for seq_len, smoothing in itertools.product(seq_lens, smoothings):
+        model = NgramModel(vocab_size, seq_len, smoothing)
+        for tape in dataloader(train_tokens, seq_len):
+            model.train(tape)
+        
+        train_loss = eval_split(model, train_tokens)
+        val_loss = eval_split(model, val_tokens)
+        print(f"seq_len {seq_len} | smoothing {smoothing:.2f} | train_loss {train_loss:.4f} | val_loss {val_loss:.4f}")
+        
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_kwargs = {'seq_len': seq_len, 'smoothing': smoothing}
+    
+    # Train final model with best parameters
+    print("Best hyperparameters:", best_kwargs)
+    model = NgramModel(vocab_size, **best_kwargs)
+    for tape in dataloader(train_tokens, model.seq_len):
         model.train(tape)
-    # evaluate the train/val loss
-    train_loss = eval_split(model, train_tokens)
-    val_loss = eval_split(model, val_tokens)
-    print("seq_len %d | smoothing %.2f | train_loss %.4f | val_loss %.4f"
-          % (seq_len, smoothing, train_loss, val_loss))
-    # update the best hyperparameters
-    if val_loss < best_loss:
-        best_loss = val_loss
-        best_kwargs = {'seq_len': seq_len, 'smoothing': smoothing}
+    
+    # Generate samples
+    sample_rng = RNG(1337)
+    n_samples = 5
+    print("\nGenerated samples:")
+    for _ in range(n_samples):
+        tape = [token_to_idx['\n']] * (model.seq_len - 1)  # Start with newline token
+        generated_tokens = []
+        
+        while True:
+            probs = model(tape)
+            coinf = sample_rng.random()
+            next_token = sample_discrete(probs.tolist(), coinf)
+            next_token_str = idx_to_token[next_token]
+            
+            generated_tokens.append(next_token_str)
+            if next_token_str == '\n' or len(generated_tokens) > 100:  # Prevent infinite sequences
+                break
+            
+            tape.append(next_token)
+            if len(tape) > model.seq_len - 1:
+                tape = tape[1:]
+        
+        print(' '.join(generated_tokens))
+    
+    # Evaluate final model
+    test_loss = eval_split(model, test_tokens)
+    test_perplexity = np.exp(test_loss)
+    print(f"\nTest loss: {test_loss:.4f}, Test perplexity: {test_perplexity:.4f}")
 
-# re-train the model with the best hyperparameters
-seq_len = best_kwargs['seq_len']
-print("best hyperparameters:", best_kwargs)
-model = NgramModel(vocab_size, **best_kwargs)
-for tape in dataloader(train_tokens, seq_len):
-    model.train(tape)
-
-# sample from the model
-sample_rng = RNG(1337)
-tape = [EOT_TOKEN] * (seq_len - 1)
-for _ in range(200):
-    probs = model(tape)
-    # sample the next token
-    coinf = sample_rng.random()
-    probs_list = probs.tolist()
-    next_token = sample_discrete(probs_list, coinf)
-    # otherwise update the token tape, print token and continue
-    next_char = token_to_char[next_token]
-    # update the tape
-    tape.append(next_token)
-    if len(tape) > seq_len - 1:
-        tape = tape[1:]
-    print(next_char, end='')
-print() # newline
-
-# at the end, evaluate and report the test loss
-test_loss = eval_split(model, test_tokens)
-test_perplexity = np.exp(test_loss)
-print("test_loss %f, test_perplexity %f" % (test_loss, test_perplexity))
-
-# get the final counts, normalize them to probs, and write to disk for vis
-counts = model.counts + model.smoothing
-probs = counts / counts.sum(axis=-1, keepdims=True)
-vis_path = os.path.join("dev", "ngram_probs.npy")
-np.save(vis_path, probs)
-print(f"wrote {vis_path} to disk (for visualization)")
+if __name__ == '__main__':
+    main()
