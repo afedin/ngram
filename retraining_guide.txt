@@ -1,0 +1,257 @@
+Инструкция по дообучению модели на новых данных
+
+1. Подготовка новых данных
+   1.1. Требования к формату данных:
+       - Каждый адрес должен быть на новой строке
+       - Формат: latitude,longitude|street_address|locality|region|postcode
+       - Пример: 55.853729,-4.254518|40 Carlton Pl|Glasgow|Lanarkshire|G5 9TS
+   
+   1.2. Проверка качества данных:
+       Выполните следующие команды для базовой проверки данных:
+       ```bash
+       # Проверка формата данных
+       head -n 5 your_new_data.csv  # Просмотр первых 5 строк
+       
+       # Подсчет общего количества записей
+       wc -l your_new_data.csv
+       
+       # Проверка на пустые строки
+       grep -c "^$" your_new_data.csv
+       
+       # Проверка формата координат (должны быть числа с точкой)
+       awk -F'|' '{print $1}' your_new_data.csv | grep -v "^-\?[0-9]\+\.[0-9]\+,-\?[0-9]\+\.[0-9]\+$"
+       
+       # Поиск строк с неправильным количеством разделителей
+       awk -F'|' 'NF!=5' your_new_data.csv
+       
+       # Поиск дубликатов
+       sort your_new_data.csv | uniq -d
+       ```
+
+2. Предварительная обработка
+   2.1. Создание рабочей копии данных:
+       ```bash
+       # Создание рабочей директории
+       mkdir -p data/retraining_$(date +%Y%m%d)
+       cd data/retraining_$(date +%Y%m%d)
+       
+       # Копирование данных
+       cp ../../your_new_data.csv raw_data.csv
+       ```
+   
+   2.2. Запуск предобработки:
+       ```bash
+       # Активация виртуального окружения
+       source ../../venv/bin/activate
+       
+       # Запуск предобработки
+       python3 ../../data/preprocess_geo.py \
+           --input raw_data.csv \
+           --output processed_data.txt \
+           --log-file preprocessing.log
+       
+       # Проверка результатов
+       head -n 5 processed_data.txt
+       wc -l processed_data.txt
+       ```
+   
+   2.3. Анализ результатов предобработки:
+       ```bash
+       # Проверка статистики обработки
+       cat preprocessing.log
+       
+       # Поиск потенциальных проблем в обработанных данных
+       grep -i "error" preprocessing.log
+       grep -i "warning" preprocessing.log
+       
+       # Проверка распределения компонентов адреса
+       awk -F'|' '{print NF}' processed_data.txt | sort | uniq -c
+       ```
+
+3. Разделение и объединение данных
+   3.1. Создание резервных копий:
+       ```bash
+       # Создание директории для бэкапов
+       mkdir -p ../../data/backups_$(date +%Y%m%d)
+       
+       # Копирование текущих наборов данных
+       cp ../../data/train.txt ../../data/backups_$(date +%Y%m%d)/train.txt.backup
+       cp ../../data/val.txt ../../data/backups_$(date +%Y%m%d)/val.txt.backup
+       cp ../../data/test.txt ../../data/backups_$(date +%Y%m%d)/test.txt.backup
+       ```
+   
+   3.2. Разделение новых данных:
+       ```bash
+       # Подсчет количества строк для каждого набора
+       total_lines=$(wc -l < processed_data.txt)
+       train_lines=$(( total_lines * 80 / 100 ))
+       val_lines=$(( total_lines * 10 / 100 ))
+       test_lines=$(( total_lines * 10 / 100 ))
+       
+       # Случайное перемешивание и разделение
+       shuf processed_data.txt > shuffled_data.txt
+       head -n $train_lines shuffled_data.txt > new_train.txt
+       head -n $val_lines shuffled_data.txt | tail -n $val_lines > new_val.txt
+       tail -n $test_lines shuffled_data.txt > new_test.txt
+       ```
+   
+   3.3. Объединение с существующими данными:
+       ```bash
+       # Объединение наборов данных
+       cat new_train.txt >> ../../data/train.txt
+       cat new_val.txt >> ../../data/val.txt
+       cat new_test.txt >> ../../data/test.txt
+       
+       # Проверка результатов
+       echo "Размеры новых наборов данных:"
+       wc -l ../../data/train.txt
+       wc -l ../../data/val.txt
+       wc -l ../../data/test.txt
+       ```
+
+4. Настройка параметров модели
+   4.1. Создание конфигурационного файла:
+       ```bash
+       # Создание файла с текущими параметрами
+       cat > retrain_config.json << EOL
+       {
+           "component_weights": {
+               "coordinates": 0.4,
+               "street": 0.3,
+               "locality": 0.15,
+               "region": 0.1,
+               "postcode": 0.05
+           },
+           "coordinate_normalization": {
+               "lat_scale": 0.01,
+               "lon_scale": 0.01
+           },
+           "similarity_threshold": 0.85,
+           "duplicate_threshold": 0.95
+       }
+       EOL
+       ```
+
+5. Запуск дообучения
+   5.1. Подготовка окружения:
+       ```bash
+       # Активация виртуального окружения (если еще не активировано)
+       source ../../venv/bin/activate
+       
+       # Проверка зависимостей
+       pip install -r ../../requirements.txt
+       
+       # Создание директории для логов
+       mkdir -p logs
+       ```
+   
+   5.2. Запуск процесса обучения:
+       ```bash
+       # Запуск с сохранением логов
+       python3 ../../address_cli.py \
+           --retrain \
+           --config retrain_config.json \
+           --log-file logs/retrain_$(date +%Y%m%d).log
+       ```
+   
+   5.3. Мониторинг процесса:
+       ```bash
+       # Просмотр логов в реальном времени
+       tail -f logs/retrain_$(date +%Y%m%d).log
+       
+       # После завершения - анализ результатов
+       grep "Accuracy" logs/retrain_$(date +%Y%m%d).log
+       grep "Processing time" logs/retrain_$(date +%Y%m%d).log
+       ```
+
+6. Тестирование и валидация
+   6.1. Автоматическое тестирование:
+       ```bash
+       # Запуск тестов с подробным выводом
+       python3 ../../test_model.py --verbose \
+           --test-file ../../data/test.txt \
+           --output-file logs/test_results_$(date +%Y%m%d).json
+       ```
+   
+   6.2. Интерактивное тестирование:
+       ```bash
+       # Запуск CLI в интерактивном режиме
+       python3 ../../address_cli.py --interactive
+       
+       # Примеры тестовых запросов:
+       # 1. Полный адрес: "55.853729,-4.254518|40 Carlton Pl|Glasgow|Lanarkshire|G5 9TS"
+       # 2. Частичный адрес: "40 Carlton Place, Glasgow"
+       # 3. Адрес с опечаткой: "40 Carlten Place, Glasgow"
+       ```
+   
+   6.3. Анализ производительности:
+       ```bash
+       # Тестирование производительности
+       time python3 ../../test_model.py --benchmark \
+           --iterations 1000 \
+           --output-file logs/benchmark_$(date +%Y%m%d).json
+       
+       # Анализ результатов
+       python3 ../../test_model.py --analyze-results \
+           logs/benchmark_$(date +%Y%m%d).json
+       ```
+
+7. Откат изменений (при необходимости)
+   7.1. Восстановление из резервной копии:
+       ```bash
+       # Проверка наличия бэкапов
+       ls -l ../../data/backups_$(date +%Y%m%d)
+       
+       # Восстановление данных
+       cp ../../data/backups_$(date +%Y%m%d)/train.txt.backup ../../data/train.txt
+       cp ../../data/backups_$(date +%Y%m%d)/val.txt.backup ../../data/val.txt
+       cp ../../data/backups_$(date +%Y%m%d)/test.txt.backup ../../data/test.txt
+       ```
+   
+   7.2. Очистка временных файлов:
+       ```bash
+       # Удаление временных файлов
+       rm -rf processed_data.txt shuffled_data.txt new_*.txt
+       ```
+
+8. Финальные шаги
+   8.1. Очистка после успешного дообучения:
+       ```bash
+       # Удаление временных файлов
+       rm -rf processed_data.txt shuffled_data.txt new_*.txt
+       
+       # Архивация логов
+       tar -czf logs_$(date +%Y%m%d).tar.gz logs/
+       mv logs_$(date +%Y%m%d).tar.gz ../../data/logs/
+       ```
+   
+   8.2. Обновление документации:
+       ```bash
+       # Создание отчета о дообучении
+       cat > retraining_report_$(date +%Y%m%d).md << EOL
+       # Отчет о дообучении модели $(date +%Y-%m-%d)
+       
+       ## Статистика данных
+       - Исходный размер данных: $(wc -l < raw_data.csv)
+       - Размер после обработки: $(wc -l < processed_data.txt)
+       - Финальные размеры наборов:
+           - Обучающий: $(wc -l < ../../data/train.txt)
+           - Валидационный: $(wc -l < ../../data/val.txt)
+           - Тестовый: $(wc -l < ../../data/test.txt)
+       
+       ## Метрики качества
+       $(grep "Accuracy" logs/retrain_$(date +%Y%m%d).log)
+       
+       ## Производительность
+       $(grep "Processing time" logs/retrain_$(date +%Y%m%d).log)
+       EOL
+       ```
+
+Важные замечания:
+1. Все команды предполагают выполнение из корневой директории проекта
+2. Перед выполнением команд убедитесь, что виртуальное окружение активировано
+3. Регулярно проверяйте логи на наличие ошибок и предупреждений
+4. Сохраняйте все отчеты и метрики для последующего анализа
+5. При возникновении ошибок обращайтесь к логам для диагностики
+6. Рекомендуется выполнять дообучение на машине с достаточным объемом памяти и CPU
+7. Все временные метки в именах файлов помогают отслеживать историю изменений
